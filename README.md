@@ -1,15 +1,20 @@
-# User0332/rewards-farmer
+# DuyThuc12/rewards-farmer-auto
 
-Automation for MS Rewards based on [https://youtu.be/4qdPcMNaioA](https://youtu.be/4qdPcMNaioA).
+Automated Microsoft Rewards farming for **Desktop + Mobile Search**, with Windows Virtual Desktop isolation, resilient Bing search recovery, and one-click Windows setup scripts.
 
-A Windows desktop app built on this farmer, with setup, run history and a schedule, lives in [mardausdennis/rewards-farmer-app](https://github.com/mardausdennis/rewards-farmer-app).
+Forked from [User0332/rewards-farmer](https://github.com/User0332/rewards-farmer) (based on [https://youtu.be/4qdPcMNaioA](https://youtu.be/4qdPcMNaioA)).
+
+A Windows desktop app built on the upstream farmer, with setup, run history and a schedule, lives in [mardausdennis/rewards-farmer-app](https://github.com/mardausdennis/rewards-farmer-app).
 
 ## Table of Contents
 
+- [Quick Start (Windows)](#quick-start-windows)
 - [Core Setup & Running Instructions](#core-setup--running-instructions)
-	- [Where search queries come from](#where-search-queries-come-from)
 	- [Installing Dependencies](#installing-dependencies)
-	- [Profile Setup](#profile-setup)
+	- [Configuration Script](#configuration-script)
+	- [Where search queries come from](#where-search-queries-come-from)
+	- [Single Profile Setup](#single-profile-setup)
+- [Mobile Search](#mobile-search)
 - [If Edge will not start](#if-edge-will-not-start)
 - [Running more than one account](#running-more-than-one-account)
 - [Docker](#docker)
@@ -17,22 +22,50 @@ A Windows desktop app built on this farmer, with setup, run history and a schedu
 - [Conditional runs and records](#conditional-runs-and-records)
 - [Windows Virtual Desktop (Windows only)](#windows-virtual-desktop-windows-only)
 
+## Quick Start (Windows)
+
+For the fastest setup on a new Windows PC, use the included interactive batch scripts (see [`README_SETUP.md`](README_SETUP.md) for the full step-by-step guide):
+
+1. Clone or download this repository:
+   ```sh
+   git clone https://github.com/DuyThuc12/rewards-farmer-auto.git
+   cd rewards-farmer-auto
+   ```
+2. Double-click **`setup.bat`** to automatically check Python 3.12+, optionally install Ollama + `llama3.2`, create `venv`, install dependencies, generate `.env`, create a Desktop shortcut, and open Edge for first-time sign-in.
+3. Run **`run_rewards.bat`** (or `Run_Rewards_Bot.bat` on your Desktop) each day to complete both Desktop and Mobile Rewards on an isolated Virtual Desktop.
+
+For **Windows Task Scheduler** (exit without waiting for a keypress):
+```sh
+run_rewards.bat --no-pause
+```
 
 ## Core Setup & Running Instructions
 
-IMPORTANT: Use at your own risk. Microsoft may take action against your account for using automated scripts to gain rewards points. The YouTube video contains more details about the techniques implemented to avoid detection of this script.
+> [!IMPORTANT]
+> Use at your own risk. Microsoft may take action against your account for using automated scripts to gain rewards points. The YouTube video contains more details about the techniques implemented to avoid detection of this script.
 
-Clone the repository.
+Clone the repository:
 
 ```sh
-git clone https://github.com/User0332/rewards-farmer
-cd rewards-farmer
+git clone https://github.com/DuyThuc12/rewards-farmer-auto.git
+cd rewards-farmer-auto
 ```
 
 ### Installing Dependencies
 
+You must have **Python 3.12+** installed. You can install dependencies either with `venv` + `pip` or with Poetry:
+
+**Option A — `venv` + `requirements.txt` (used by `setup.bat`):**
+
+Windows (PowerShell)
+```sh
+python -m venv venv
+.\venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+**Option B — Poetry:**
+
 Activate the virtual environment & install dependencies (you may have to use `python -m poetry` instead of `poetry`).
-You must have Python 3.12+ and Poetry installed.
 
 If `iex (poetry env activate)` fails with *"Cannot bind argument to parameter 'Command' because it is null"*, `poetry install` did not create an environment. Run `python --version` first: an older Python leaves poetry with nothing to activate, and the message explaining that goes to stderr rather than into `iex`.
 
@@ -50,7 +83,7 @@ poetry install
 eval $(poetry env activate)
 ```
 
-You must also have a [webdriver for Microsoft Edge](https://learn.microsoft.com/en-us/microsoft-edge/webdriver/?tabs=c-sharp) installed. If you already have the Edge Browser installed, you probably have this component as well.
+You must also have a [webdriver for Microsoft Edge](https://learn.microsoft.com/en-us/microsoft-edge/webdriver/?tabs=c-sharp) installed. If you already have the Edge Browser installed, Selenium Manager normally handles this automatically.
 
 ### Configuration Script
 
@@ -62,13 +95,15 @@ Running `init-config.py` with the `--manage-accounts` flag (shown below) will al
 py .\src\init-config.py --manage-accounts
 ```
 
+For signing into multiple accounts properly, see the [relevant notice](#proper-signin-notice).
+
 ### Where search queries come from
 
 The bot needs short strings to type into Bing. Two backends produce them, set with `QUERY_SOURCE`:
 
 | `QUERY_SOURCE` | Needs | Notes |
 | --- | --- | --- |
-| `llm` (default) | OpenRouter or Ollama account + model | `llm` via Ollama is the current behaviour, unchanged |
+| `llm` (default) | OpenRouter or Ollama account + model | `llm` via Ollama is the current behaviour |
 | `trends` | nothing | Google Trends, Wikipedia and Bing autosuggest |
 
 ```sh
@@ -78,40 +113,69 @@ $env:QUERY_SOURCE="trends"; python src/main.py  # PowerShell
 
 `trends` needs no account, no API key and no model download, so the LLM setup below is optional if you use it. If every feed is unreachable it falls back to `nouns.txt` rather than failing the run.
 
-If you would like to use LLMs, you should also configure an LLM provider through a `.env` file in the project root. The script now talks to either OpenRouter or a local OpenAI-compatible LLM endpoint depending on `LLM_PROVIDER`.
+If you would like to use LLMs, you should configure an LLM provider through a `.env` file in the project root. The script talks to either OpenRouter or a local OpenAI-compatible LLM endpoint depending on `LLM_PROVIDER`.
 
 A sample `nouns.txt` file is included in the project root and can be modified by the user to contain seed words for an LLM to complete 20 searches. The wordlist should be separated by newline.
 
 Example `.env` values:
 
 ```env
-LLM_PROVIDER=openrouter
-OPENROUTER_API_KEY=your_key_here
-OPENROUTER_MODEL=openai/gpt-4o-mini
+QUERY_SOURCE=llm
+LLM_PROVIDER=local
+LOCAL_LLM_BASE_URL=http://localhost:11434/v1
+LOCAL_LLM_MODEL=llama3.2
 
-# Or use a local endpoint instead
-# LLM_PROVIDER=local
-# LOCAL_LLM_BASE_URL=http://localhost:11434/v1
-# LOCAL_LLM_MODEL=gemma3:4b
+# Or use OpenRouter instead
+# LLM_PROVIDER=openrouter
+# OPENROUTER_API_KEY=your_key_here
+# OPENROUTER_MODEL=openai/gpt-4o-mini
+
+# Optional: enable mobile searches & Windows Virtual Desktop
+ENABLE_MOBILE_SEARCH=true
+USE_VIRTUAL_DESKTOP=true
+CLEANUP_VIRTUAL_DESKTOP=true
 ```
 
 For OpenRouter, the code uses the OpenAI-compatible chat completions API at `https://openrouter.ai/api/v1/chat/completions`. For local models, the endpoint must also be OpenAI-compatible. More configuration options can be found in [`.env.example`](.env.example).
 
 If the configuration options are not provided, they default to `LLM_PROVIDER=local`, `LOCAL_LLM_BASE_URL=http://localhost:11434/v1`, `LOCAL_LLM_MODEL=gemma4:cloud`, and `OPENROUTER_MODEL=openrouter/free`.
 
-You must also provide an image for the script to upload to complete the visual search task. A helper script is included at `src/random_image_for_visual_search.py` that will download an image from Wikipedia named `visual_search.jpg` into the project root for you. You may also provide an image of your own, just ensure that the absolute path of the image is placed in the `VISUAL_SEARCH_IMAGE_PATH` constant at the top of `rewards_tasks.py`.
+For the visual search task, the bot automatically downloads a random image from Wikipedia to `visual_search.jpg` in the project root when the task is available and not yet completed for the day. You can also generate one manually with `python src/random_image_for_visual_search.py` or provide your own image at `VISUAL_SEARCH_IMAGE_PATH` in `src/rewards_tasks.py`.
 
-### Profile Setup
+### Single Profile Setup
 
-The profile directory in `src/constants.py` is set to `Default`. If this signs you in to a global profile that you do not want to use for automation, then you can create a new profile from within the webdriver instance manually and then change the `PROFILE_NAME` constant to `Profile 1` (or the equivalent number).
+> [!TIP]
+> It is recommended to configure `REWARDS_ACCOUNTS` rather than run the script using the default configuration from this section, even if you are running only one account. This allows each profile to be isolated by a named data directory and makes it easier to add another account later.
+>
+> You can do this using the [configuration script](#configuration-script) or by [manual configuration](#running-more-than-one-account). This method will create entirely new profiles separate from the default profile discussed here, so you will have to complete sign in again.
 
-Run main.py (`python src/main.py`; paths are resolved from the repository, so it can be started from any directory), wait for the page to launch, and then CTRL-C to quit the application immediately. Sign in to the created profile with your Microsoft account on both Bing and `rewards.bing.com`.
+By default, the script runs a single account using the `Default` profile in the base data directory. To sign in to this profile, you can do one of two things to launch the browser:
+
+1. Run `setup.bat` (Step 6) or `python src/main.py` (paths are resolved from the repository, so it can be started from any directory), wait for the page to launch, and then CTRL-C to quit the application immediately.
+2. Run Edge directly through `msedge --user-data-dir="<USER_DATA_DIR>" --profile-directory=Default https://rewards.bing.com https://www.bing.com`. Note that the default user data directory is `<repo>\data-dir`.
+
+Once the browser launches, sign in to the created profile with your Microsoft account on both Bing and `rewards.bing.com`. Additionally, see the [relevant notice](#proper-signin-notice) on signing in properly.
 
 EU Users: you may have to accept a consent banner once on `rewards.bing.com` and on the Bing search page, `bing.com`. Once you consent, your choice will be saved for future runs using the same profile, so you will not need to interact with the banner during automated runs.
 
 The bot finds buttons by their English labels, so it starts Edge with `--accept-lang=en-US` and Rewards and Bing load in English whatever language Edge is set to. Edge saves this setting in the profile, so Bing and Rewards also show up in English when you open that profile yourself.
 
-Close all webdriver browser instances. Run `main.py` again; the automation should start working.
+Close all webdriver browser instances. Run `main.py` (or `run_rewards.bat`) again; the automation should start working.
+
+## Mobile Search
+
+This repository includes integrated Mobile Bing Search automation (`src/mobile_search.py`) using Chrome DevTools Protocol (CDP) mobile emulation (iPhone / iOS user agent, mobile viewport, and touch emulation).
+
+After completing Desktop tasks, the farmer closes the Desktop Edge process and launches a clean Edge session on the same virtual desktop so Desktop headers (`MSRewards/Desktop`) do not carry over and prevent Bing from crediting mobile points.
+
+| Way to enable / run | Command or setting |
+| --- | --- |
+| CLI flag (integrated run) | `python src/main.py --mobile` |
+| Environment variable (`.env`) | `ENABLE_MOBILE_SEARCH=true` |
+| Disable even if env var is set | `python src/main.py --no-mobile` |
+| Standalone mobile-only script | `python mobile_rewards_search.py` or `run_mobile_search.bat` |
+
+Both desktop and mobile searches verify navigation to a Bing results page and container rendering, with automatic 3-step recovery (`reload` -> `bing home` -> `direct search URL`) if a query fails to confirm.
 
 ## If Edge will not start
 
@@ -141,8 +205,14 @@ REWARDS_ACCOUNTS=personal,spare python src/main.py
 Each is signed in once by hand, the same way as the single profile, using its own directory:
 
 ```
-msedge --user-data-dir="<repo>\data-dir\personal" --profile-directory=Default https://rewards.bing.com
+msedge --user-data-dir="<USER_DATA_DIR>\personal" --profile-directory=Default https://rewards.bing.com
 ```
+
+Note that the default user data directory is `<repo>\data-dir`.
+
+<a id="proper-signin-notice"></a>
+> [!NOTE]
+> When signing in to an account, whether through the above command or through the accounts manager in the configuration script, you must ensure that you sign in to the Edge profile, `rewards.bing.com`, *and* `bing.com` so that the script never accidentally uses a global account associated with your Windows account. To do this, when you launch the sign-in window either via the above command or the accounts manager, look for the profile icon in the top right hand corner of the window and click on it. If the browser does not display the desired account, click on "Profile settings" and select "Sign out" on the page that appears. The Edge window will briefly refresh. Then, click on the profile icon in the top right again. There should be a dropdown menu of accounts to choose from. Choose the correct account and sign in. Then, head to `rewards.bing.com` and `bing.com` to make sure they are both using the desired account. If they are not, sign out from those sites and then click sign in.
 
 They run one after another, and an account that fails is reported and skipped rather than ending the run, whether it fails to start or dies partway through. Leave `REWARDS_ACCOUNTS` unset and everything behaves exactly as before, using the single profile in `data-dir`.
 
@@ -179,7 +249,7 @@ Signing in signs the browser in, not just the website, so Edge may sync bookmark
 
 ### Using a local LLM with Docker
 
-Point the base URL to the Docker host gateway. Example .env for Ollama Llama 3.2:
+Point the base URL to the Docker host gateway. Example `.env` for Ollama Llama 3.2:
 ```env
 QUERY_SOURCE=llm
 LLM_PROVIDER=local
@@ -222,7 +292,7 @@ REWARDS_ACCOUNTS=spare    docker compose run --rm --service-ports signin
 REWARDS_ACCOUNTS=personal,spare docker compose run --rm rewards-farmer
 ```
 
-`REWARDS_HEADLESS=1` is set in the image. It also works on the host if you want a run with no visible window; the pointer code needs an explicit window size in that mode, which `main.py` sets.
+`REWARDS_HEADLESS=1` is set in the image. It also works on the host if you want a run with no visible window; the pointer code needs an explicit window size in that mode, which `browser.py` sets.
 
 ## Logging
 
@@ -238,7 +308,7 @@ Windows (PowerShell)
 $env:REWARDS_FARMER_LOG_LEVEL="DEBUG"; $env:REWARDS_FARMER_LOG_FILE="run.log"; python src/main.py
 ```
 
-*nix (Bash)
+\*nix (Bash)
 ```sh
 REWARDS_FARMER_LOG_LEVEL=DEBUG REWARDS_FARMER_LOG_FILE=run.log python src/main.py
 ```
@@ -247,23 +317,30 @@ If you are opening an issue about a crash, running with `REWARDS_FARMER_LOG_LEVE
 
 ## Conditional runs and records
 
-`--read-state` records open work before and after farming. `--check-only` reads it without starting tasks; it still opens Edge to inspect the Rewards page
-
-`--only-if-open` reads first and runs when at least 15 points are known to be open, or a quest step is unlocked. Change the threshold with `--min-points`; when only a quest qualifies, only quests run. An unreadable page is skipped unless you also pass `--run-if-unreadable`. `--unattended` exits without waiting for Enter
+| Flag | Effect |
+| --- | --- |
+| `--unattended` | Exit without waiting for Enter, for scheduled runs. |
+| `--mobile` | Also run mobile searches after desktop tasks. |
+| `--no-mobile` | Disable mobile searches even if `ENABLE_MOBILE_SEARCH` is set. |
+| `--read-state` | Record open work before and after farming. |
+| `--check-only` | Read open work without starting any tasks (still opens Edge). |
+| `--only-if-open` | Run only when at least `--min-points` (default `15`) are open, or a quest step is unlocked. |
+| `--min-points N` | Point threshold for `--only-if-open` (default: `15`). |
+| `--run-if-unreadable` | Allow `--only-if-open` to run when the page cannot be read. |
 
 Windows (PowerShell)
 ```sh
-python src/main.py --only-if-open --min-points 20 --unattended
+python src/main.py --only-if-open --min-points 20 --mobile --unattended
 ```
 
-*nix (Bash)
+\*nix (Bash)
 ```sh
 python src/main.py --check-only --unattended
 ```
 
-Runs write timestamped JSONL records under `runs/`, with account and task outcomes and any requested state reads. `runs/quest-steps-today.json` tracks quest links already clicked today so an unchanged link does not trigger another conditional run. Without new flags, console output stays unchanged
+Runs write timestamped JSONL records under `runs/`, with account and task outcomes and any requested state reads. `runs/quest-steps-today.json` tracks quest links already clicked today so an unchanged link does not trigger another conditional run. Without new flags, console output stays unchanged.
 
-A lock under `USER_DATA_DIR` (by default `data-dir`) prevents two farmer runs from using the same profile root at once. A second run exits with code 3 before opening Edge
+A lock under `USER_DATA_DIR` (by default `data-dir`) prevents two farmer runs from using the same profile root at once. A second run exits with code 3 before opening Edge.
 
 ## Windows Virtual Desktop (Windows only)
 
@@ -283,7 +360,7 @@ Windows (PowerShell)
 $env:USE_VIRTUAL_DESKTOP="true"; python src/main.py
 ```
 
-> **Note:** The script automatically detects which virtual desktop you started from and calculates the exact number of navigation hops so it returns directly to your starting desktop. When `CLEANUP_VIRTUAL_DESKTOP=true`, the worker desktop is safely closed after you press Enter on exit, returning you to your main desktop.
+> [!NOTE]
+> The script automatically detects which virtual desktop you started from and calculates the exact number of navigation hops so it returns directly to your starting desktop. When `CLEANUP_VIRTUAL_DESKTOP=true`, the worker desktop is safely closed after you press Enter on exit (or immediately with `--unattended`), returning you to your main desktop.
 
 Please open up a GitHub issue if you run into any difficulties.
-
