@@ -654,17 +654,51 @@ class ProgressInsideTasks(unittest.TestCase):
 
 		self.assertIn("[SKIP] Visual search: not available in this UI variant", output)
 
-	def test_required_searches_count_every_search_across_rounds(self):
-		# 0/30 asks for ten searches, 15/30 after them for five more. The
-		# clear button goes missing after the second search of that round.
-		tasks = self._tasks(
-			get_bing_search_bar=lambda: "search bar",
-			get_clear_bing_search_query_button=lambda: "clear",
-		)
-		readings = iter([(0, 30), (15, 30)])
+	def _search_tasks(self, outcomes, readings):
+		"""Required searches with every search's outcome decided up front.
+
+		outcomes(call_number, query) says whether that search was confirmed.
+		The Bing page work itself is covered in test_search_quota_recovery.
+		"""
+		tasks = self._tasks()
 		tasks.read_search_points = lambda: next(readings)
-		tasks.wait_for_element = lambda getter, timeout=10: "search bar"
-		tasks.wait_for_then_click = failing_on(12, ElementNeverAppeared("nothing matched"))
+		tasks._open_bing_home = lambda: None
+		tasks._clear_search_box_best_effort = lambda: None
+		calls = []
+
+		def search(number, query):
+			calls.append(query)
+
+			if outcomes(len(calls), query):
+				return True
+
+			tasks._last_search_error = ElementNeverAppeared("nothing matched")
+			return False
+
+		tasks._search_with_recovery = search
+
+		return tasks
+
+	def test_a_search_that_cannot_be_confirmed_is_skipped_not_fatal(self):
+		# 0/30 asks for ten searches. The third one never confirms, which used
+		# to end the task as "[FAIL] ... sent 2 searches". Now it is skipped,
+		# the other nine go out, and a second round fills the quota.
+		readings = iter([(0, 30), (27, 30), (30, 30)])
+		tasks = self._search_tasks(lambda call, query: call != 3, readings)
+
+		with mock.patch.object(rewards_tasks.queries, "related_queries", lambda count: ["query"] * count):
+			output = self._report(tasks, "complete_required_searches")
+
+		self.assertIn("Round 1: 9 searches -> 27/30", output)
+		self.assertIn("Search quota complete: 30/30", output)
+		self.assertIn("[OK] Required searches", output)
+
+	def test_required_searches_count_every_search_across_rounds(self):
+		# 0/30 asks for ten searches, 15/30 after them for five more. From the
+		# third search of that round on nothing confirms, and three skipped
+		# in a row stop the batch. The recovery reading fails too.
+		readings = iter([(0, 30), (15, 30)])
+		tasks = self._search_tasks(lambda call, query: call <= 12, readings)
 
 		with mock.patch.object(rewards_tasks.queries, "related_queries", lambda count: ["query"] * count):
 			output = self._report(tasks, "complete_required_searches")
@@ -677,21 +711,18 @@ class ProgressInsideTasks(unittest.TestCase):
 	def test_a_source_that_comes_back_short_is_counted_as_it_was(self):
 		# The trends source can return fewer queries than a round asks for.
 		# 0/30 asks for ten and gets three, 9/30 then asks for seven and gets
-		# three again. The clear button goes missing after the second search of
-		# that round, which is the fifth search sent, not the twelfth.
-		tasks = self._tasks(
-			get_bing_search_bar=lambda: "search bar",
-			get_clear_bing_search_query_button=lambda: "clear",
-		)
-		readings = iter([(0, 30), (9, 30)])
-		tasks.read_search_points = lambda: next(readings)
-		tasks.wait_for_element = lambda getter, timeout=10: "search bar"
-		tasks.wait_for_then_click = failing_on(5, ElementNeverAppeared("nothing matched"))
+		# three again. Searches stop confirming after the fifth one sent, not
+		# the twelfth.
+		readings = iter([(0, 30), (9, 30), (9, 30)])
+		tasks = self._search_tasks(lambda call, query: call <= 5, readings)
 
 		with mock.patch.object(rewards_tasks.queries, "related_queries", lambda count: ["query"] * min(count, 3)):
 			output = self._report(tasks, "complete_required_searches")
 
 		self.assertIn("Round 1: 3 searches -> 9/30", output)
+		# One search of round two was skipped, the quota stayed short, so the
+		# skipped search's error is what the task reports.
+		self.assertIn("Round 2: 2 searches -> 9/30", output)
 		self.assertIn(
 			"[FAIL] Required searches: sent 5 searches, then the next element never appeared",
 			output,

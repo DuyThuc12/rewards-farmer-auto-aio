@@ -4,17 +4,24 @@ import os
 import random
 import time
 from typing import Callable
+from urllib.parse import quote_plus
 from selenium import webdriver
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.remote.webelement import WebElement
-from selenium.common.exceptions import StaleElementReferenceException, TimeoutException, NoSuchElementException
+from selenium.common.exceptions import (
+	StaleElementReferenceException, TimeoutException, NoSuchElementException,
+	ElementNotInteractableException, ElementClickInterceptedException,
+	MoveTargetOutOfBoundsException,
+)
 import tab_utils
 import queries
 import mouse_trajectory
 import mimic_typing
 import element_selectors
+import mobile_search
 import run_record
 import quest_steps
 
@@ -31,8 +38,29 @@ TASKS = (
 	("searches", "Required searches", "complete_required_searches"),
 	("bonus", "Bonus points", "claim_bonus_points"),
 )
+MOBILE_TASK = ("mobile_searches", "Mobile searches", "complete_mobile_searches")
 TASK_IDS = tuple(task_id for task_id, _, _ in TASKS)
 REWARDS_HOME_URL = "https://rewards.bing.com/"
+REWARDS_EARN_URL = "https://rewards.bing.com/earn"
+BING_HOME_URL = "https://www.bing.com/"
+SEARCH_SUFFIX = " -noai"
+
+# How a single search that could not be confirmed is retried, in order. The
+# first try is always typing into the page that is already open.
+SEARCH_RECOVERY_STEPS = ("reload", "bing home", "direct search URL")
+# Skipping one search is fine, a row of them means Bing itself is not
+# working, and the round-level recovery should look at it instead.
+MAX_CONSECUTIVE_SKIPPED_SEARCHES = 3
+# Where the search points are read again after a batch could not be
+# verified, one attempt per entry.
+POINTS_RECOVERY_URLS = (REWARDS_EARN_URL, REWARDS_HOME_URL, REWARDS_EARN_URL)
+# What one search attempt can fail with and still be worth retrying. A
+# closed browser (plain WebDriverException) is not on the list on purpose.
+RECOVERABLE_SEARCH_ERRORS = (
+	TimeoutException, NoSuchElementException, StaleElementReferenceException,
+	ElementNotInteractableException, ElementClickInterceptedException,
+	MoveTargetOutOfBoundsException,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +120,11 @@ def task_failure_report(exc: BaseException, progress: str | None = None) -> tupl
 		cause = f"the next element never appeared ({name})"
 
 	return "FAIL", f"{progress}, then {cause}"
+
+
+# Shared with mobile_search, which cannot import this module.
+_normalized = element_selectors._normalized
+is_bing_results_url = element_selectors.is_bing_results_url
 
 
 class RewardsTaskUtils:
@@ -485,7 +518,12 @@ class RewardsTaskUtils:
 
 		sent = 0
 		self._searches_sent = 0
+		self._last_search_error = None
 		self.progress = "sent 0 searches"
+		# The last error a round recovered from without the quota filling. It
+		# no longer ends the task on the spot, but a quota that stays short
+		# because of it is still reported as a failure, not as [OK].
+		unresolved_error: BaseException | None = None
 
 		for round_number in range(1, max_rounds + 1):
 			if points_earned >= max_pts:
@@ -505,17 +543,22 @@ class RewardsTaskUtils:
 				# The last query can fill the quota before its clear button or the
 				# returning earn page is ready. Only a fresh reading can prove that.
 				logger.warning(
-					"Search result could not be verified after %s %s (%s), reloading once",
-					self._searches_sent, "search" if self._searches_sent == 1 else "searches", type(exc).__name__
+					"Search result could not be verified after %s %s (%s), reloading up to %s times",
+					self._searches_sent, "search" if self._searches_sent == 1 else "searches", type(exc).__name__,
+					len(POINTS_RECOVERY_URLS)
 				)
-				try:
-					self.driver.get("https://rewards.bing.com/earn")
-					self.tab_utils.ensure_focus()
-					points_earned, max_pts = self.read_search_points()
-				except Exception:
+				reading = self._recover_search_points()
+
+				if reading is None:
 					raise exc
+
+				points_earned, max_pts = reading
+
+				# Previously a short reading here re-raised and failed the whole
+				# task after one search. The reading is fresh, so carry on with
+				# the next round and let the measured points decide.
 				if points_earned < max_pts:
-					raise
+					unresolved_error = exc
 			sent += batch
 
 			logger.info(
@@ -529,8 +572,29 @@ class RewardsTaskUtils:
 
 		if points_earned < max_pts:
 			logger.warning("Search quota not filled: %s/%s", points_earned, max_pts)
+
+			error = unresolved_error or self._last_search_error
+
+			if error is not None:
+				raise error
 		else:
 			logger.info("Search quota complete: %s/%s", points_earned, max_pts)
+
+	def _recover_search_points(self) -> tuple[int, int] | None:
+		"""Read the search points again from a fresh page, or None if it never works."""
+		for attempt, url in enumerate(POINTS_RECOVERY_URLS, start=1):
+			try:
+				self.driver.get(url)
+				self.tab_utils.ensure_focus()
+
+				return self.read_search_points()
+			except Exception as exc:
+				logger.warning(
+					"Reload %s/%s could not read the search points (%s)",
+					attempt, len(POINTS_RECOVERY_URLS), type(exc).__name__
+				)
+
+		return None
 
 	def complete_quests(self, max_steps: int = 8):
 		"""Work through the punch cards in the quests section.
@@ -645,47 +709,251 @@ class RewardsTaskUtils:
 
 		return points_earned, max_pts
 
+	# Seconds. Class attributes so tests can shrink them.
+	SEARCH_BOX_TIMEOUT = 10
+	SEARCH_SUBMIT_TIMEOUT = 10
+	SEARCH_RESULTS_TIMEOUT = 15
+
 	def run_search_batch(self, count: int, already_sent: int = 0) -> int:
 		"""Search up to count queries and return how many actually went out.
 
 		The trends source can come back with fewer queries than asked for, so
-		the caller cannot assume count.
+		the caller cannot assume count. A search that cannot be confirmed even
+		after SEARCH_RECOVERY_STEPS is skipped rather than ending the batch;
+		only MAX_CONSECUTIVE_SKIPPED_SEARCHES in a row raise.
 		"""
 		self._searches_sent = already_sent
-		self.driver.get("https://www.bing.com/")
-		self.tab_utils.ensure_focus()
-
-		self.dismiss_cookie_consent()
-
-		self.wait_for_element(self.elements.get_bing_search_bar)
-
-		# search bar should be auto-focused
+		self._open_bing_home()
 
 		sent_here = 0
+		skipped_in_a_row = 0
 
-		for i, query in enumerate(
-			queries.related_queries(count)
-		):
-			self.keyboard.send_keys(f"{query} -noai{Keys.ENTER}")
-			sent_here = i + 1
+		for query in queries.related_queries(count):
+			number = already_sent + sent_here + 1
+
+			if not self._search_with_recovery(number, query):
+				skipped_in_a_row += 1
+
+				if skipped_in_a_row >= MAX_CONSECUTIVE_SKIPPED_SEARCHES:
+					raise self._last_search_error
+
+				continue
+
+			skipped_in_a_row = 0
+			sent_here += 1
 			sent = already_sent + sent_here
 			self._searches_sent = sent
 			self.progress = f"sent {sent} {'search' if sent == 1 else 'searches'}"
 
 			time.sleep(random.uniform(5.5, 7.5))
 
-			try: self.wait_for_then_click(self.elements.get_clear_bing_search_query_button)
-			except StaleElementReferenceException:
-				logger.warning(
-					"StaleElementReferenceException when trying to click the clear button for query %s. Trying again...",
-					i + 1
-				)
-				self.wait_for_then_click(self.elements.get_clear_bing_search_query_button)
+			self._clear_search_box_best_effort()
 
 		self.driver.get(REWARDS_HOME_URL)
 		self.tab_utils.ensure_focus()
 
 		return sent_here
+
+	def _open_bing_home(self):
+		"""Open bing.com and wait for a usable search box, reloading once if needed."""
+		self.driver.get(BING_HOME_URL)
+		self.tab_utils.ensure_focus()
+
+		self.dismiss_cookie_consent()
+
+		try:
+			self.wait_for_element(self._ready_search_box, timeout=self.SEARCH_BOX_TIMEOUT)
+		except TimeoutException as exc:
+			logger.warning("Bing search box not ready (%s), reloading once", type(exc).__name__)
+			self.driver.get(BING_HOME_URL)
+			self.tab_utils.ensure_focus()
+			self.dismiss_cookie_consent()
+			self.wait_for_element(self._ready_search_box, timeout=self.SEARCH_BOX_TIMEOUT * 2)
+
+	def _ready_search_box(self) -> WebElement:
+		"""The search box, only once it is visible and accepts input."""
+		box = self.elements.get_bing_search_bar()
+
+		is_displayed = getattr(box, "is_displayed", None)
+		is_enabled = getattr(box, "is_enabled", None)
+
+		if (is_displayed and not is_displayed()) or (is_enabled and not is_enabled()):
+			raise element_selectors.ElementNotReady("Bing search box is present but not usable yet")
+
+		return box
+
+	@staticmethod
+	def _box_value(box) -> str | None:
+		"""What the box holds, or None if that cannot be read."""
+		get_attribute = getattr(box, "get_attribute", None)
+
+		if get_attribute is None:
+			return None
+
+		try:
+			return get_attribute("value")
+		except (StaleElementReferenceException, NoSuchElementException):
+			return None
+
+	def _results_ready(self):
+		"""A truthy value once the results page rendered, raising until then.
+
+		Any of the known result containers is enough. A page that finished
+		loading counts too, because the URL has already been checked to be the
+		results page by the time this is asked.
+		"""
+		try:
+			return self.elements.get_bing_results_marker()
+		except NoSuchElementException as exc:
+			try:
+				state = self.driver.execute_script("return document.readyState")
+			except Exception:
+				state = None
+
+			if state == "complete" and is_bing_results_url(self.driver.current_url):
+				return True
+
+			raise exc
+
+	def _focus_and_clear_search_box(self) -> WebElement:
+		box = self.wait_for_element(self._ready_search_box, timeout=self.SEARCH_BOX_TIMEOUT)
+
+		# Focus by clicking rather than trusting autofocus. Keys sent before
+		# Bing's script had focused the box went nowhere, and the wait for
+		# the result then ran its full length.
+		self.move_to_and_click(box)
+
+		if self._box_value(box):
+			self._clear_search_box_best_effort()
+
+			if self._box_value(box):
+				try:
+					ActionChains(self.driver).key_down(Keys.CONTROL).send_keys("a") \
+						.key_up(Keys.CONTROL).send_keys(Keys.BACKSPACE).perform()
+				except Exception:
+					pass
+
+		return box
+
+	def _clear_search_box_best_effort(self):
+		"""Click Bing's clear button if it is there. Never raises.
+
+		This used to be a wait_for_then_click whose timeout ended the whole
+		task. The next search clears and focuses the box itself, so a missing
+		clear button costs nothing.
+		"""
+		try:
+			self.move_to_and_click(self.elements.get_clear_bing_search_query_button)
+		except Exception:
+			pass
+
+	def _wait_for_results_url(self, before_url: str, query: str, timeout: float) -> bool:
+		def navigated(_):
+			url = self.driver.current_url
+
+			return is_bing_results_url(url) and (url != before_url or is_bing_results_url(url, query))
+
+		try:
+			WebDriverWait(self.driver, timeout).until(navigated)
+		except TimeoutException:
+			return False
+
+		return True
+
+	def _type_and_submit(self, query: str):
+		self._focus_and_clear_search_box()
+		self.keyboard.send_keys(f"{query}{SEARCH_SUFFIX}{Keys.ENTER}")
+
+	def _resubmit(self, query: str):
+		"""Submit again after the first Enter did not navigate."""
+		try:
+			box = self.wait_for_element(self._ready_search_box, timeout=self.SEARCH_BOX_TIMEOUT)
+		except TimeoutException:
+			box = None
+
+		value = self._box_value(box) if box is not None else None
+
+		# The text never arrived, so pressing Enter again would submit an
+		# empty box. Type it again.
+		if box is None or (value is not None and _normalized(query) not in _normalized(value)):
+			self._type_and_submit(query)
+			return
+
+		try:
+			self.move_to_and_click(self.elements.get_bing_search_submit_button)
+		except RECOVERABLE_SEARCH_ERRORS:
+			self.move_to_and_click(box)
+			self.keyboard.send_keys(Keys.ENTER)
+
+	def _submit_search(self, number: int, query: str):
+		"""Type one query and return once its results page has rendered."""
+		before_url = self.driver.current_url
+
+		self._type_and_submit(query)
+
+		if not self._wait_for_results_url(before_url, query, self.SEARCH_SUBMIT_TIMEOUT):
+			logger.warning(
+				"Search %s did not open the results page within %ss, submitting again",
+				number, self.SEARCH_SUBMIT_TIMEOUT
+			)
+			self._resubmit(query)
+
+			if not self._wait_for_results_url(before_url, query, self.SEARCH_SUBMIT_TIMEOUT):
+				raise TimeoutException(
+					f"Bing stayed on {self.driver.current_url} after submitting search {number} twice"
+				)
+
+		self.wait_for_element(self._results_ready, timeout=self.SEARCH_RESULTS_TIMEOUT)
+
+	def _recover_search_page(self, step: str, query: str):
+		if step == "reload":
+			self.driver.refresh()
+		elif step == "bing home":
+			self.driver.get(BING_HOME_URL)
+		else:
+			self.driver.get(
+				f"{BING_HOME_URL}search?q={quote_plus(query + SEARCH_SUFFIX)}&form=QBLH"
+			)
+
+		self.tab_utils.ensure_focus()
+		self.dismiss_cookie_consent(timeout=2)
+
+	def _search_with_recovery(self, number: int, query: str) -> bool:
+		"""Send one search, retrying through SEARCH_RECOVERY_STEPS. False if skipped."""
+		error: BaseException | None = None
+		total = len(SEARCH_RECOVERY_STEPS)
+
+		for attempt, step in enumerate((None, *SEARCH_RECOVERY_STEPS)):
+			try:
+				if step is None:
+					self._submit_search(number, query)
+					return True
+
+				logger.warning(
+					"Search %s could not be confirmed (%s), retry %s/%s via %s",
+					number, type(error).__name__, attempt, total, step
+				)
+				self._recover_search_page(step, query)
+
+				if step == "direct search URL":
+					if not is_bing_results_url(self.driver.current_url, query):
+						raise TimeoutException(f"direct search URL ended on {self.driver.current_url}")
+
+					self.wait_for_element(self._results_ready, timeout=self.SEARCH_RESULTS_TIMEOUT)
+				else:
+					self._submit_search(number, query)
+
+				return True
+			except RECOVERABLE_SEARCH_ERRORS as exc:
+				error = exc
+
+		self._last_search_error = error
+		logger.warning(
+			"Search %s skipped after %s attempts (%s), continuing with the next one",
+			number, total + 1, type(error).__name__
+		)
+
+		return False
 
 	def restore_main_tab(self):
 		"""Close the stray tabs, keeping the one the tasks work in.
@@ -746,11 +1014,24 @@ class RewardsTaskUtils:
 		except TimeoutException:
 			logger.warning("Could not find the 'Claim Bonus Points' button. There are likely no bonus points to claim at this time.")
 
-	def complete_all_tasks(self, *, only=None):
+	def complete_mobile_searches(self):
+		self.progress = "sent 0 mobile searches"
+		mobile_search.run_mobile_searches(
+			self.driver,
+			progress_cb=lambda msg: setattr(self, "progress", msg),
+		)
+		try:
+			self.driver.get(REWARDS_HOME_URL)
+			self.tab_utils.ensure_focus()
+		except Exception:
+			pass
+
+	def complete_all_tasks(self, *, only=None, include_mobile: bool = False):
 		# Each task is run independently. The Rewards UI differs by market and
 		# changes between deploys, so a task the current variant does not ship
 		# must not take the remaining ones down with it.
-		for task_id, name, method in TASKS:
+		steps = (*TASKS, MOBILE_TASK) if include_mobile else TASKS
+		for task_id, name, method in steps:
 			if only is not None and task_id not in only:
 				continue
 			began = time.monotonic()

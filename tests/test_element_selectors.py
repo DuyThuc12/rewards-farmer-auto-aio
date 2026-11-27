@@ -407,5 +407,37 @@ class CookieConsentTests(unittest.TestCase):
 			)
 
 
+class BingSearchPageFallbacks(unittest.TestCase):
+	def utils(self, children):
+		return element_selectors.ElementSelectionUtils(FakeDriver(children))
+
+	def test_search_bar_prefers_the_visible_id_over_a_hidden_textarea(self):
+		box = FakeElement("box")
+		utils = self.utils({
+			(By.CSS_SELECTOR, "#sb_form_q"): [FakeElement(displayed=False), box],
+			(By.TAG_NAME, "textarea"): [FakeElement("hidden textarea", displayed=False)],
+		})
+		self.assertIs(utils.get_bing_search_bar(), box)
+
+	def test_search_bar_falls_back_to_name_then_to_any_textarea(self):
+		named = FakeElement("named")
+		self.assertIs(self.utils({(By.CSS_SELECTOR, "input[name='q']"): [named]}).get_bing_search_bar(), named)
+
+		textarea = FakeElement("textarea")
+		self.assertIs(self.utils({(By.TAG_NAME, "textarea"): [textarea]}).get_bing_search_bar(), textarea)
+
+		with self.assertRaises(NoSuchElementException):
+			self.utils({}).get_bing_search_bar()
+
+	def test_results_marker_accepts_any_known_container(self):
+		for selector in element_selectors.ElementSelectionUtils.BING_RESULTS_SELECTORS:
+			with self.subTest(selector=selector):
+				marker = FakeElement(selector)
+				self.assertIs(self.utils({(By.CSS_SELECTOR, selector): [marker]}).get_bing_results_marker(), marker)
+
+		with self.assertRaises(NoSuchElementException):
+			self.utils({}).get_bing_results_marker()
+
+
 if __name__ == "__main__":
 	unittest.main()

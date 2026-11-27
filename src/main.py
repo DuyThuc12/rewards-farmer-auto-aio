@@ -11,6 +11,7 @@ import log_utils
 import accounts
 import browser
 import desktop_utils
+import mobile_search
 import rewards_tasks
 import rewards_state
 import element_selectors
@@ -32,6 +33,7 @@ class RunPlan:
 	check_only: bool = False
 	min_points: int = DEFAULT_MIN_POINTS
 	run_if_unreadable: bool = False
+	mobile: bool = False
 
 
 _plan = RunPlan()
@@ -68,6 +70,78 @@ def _decision_log(account, state, reason):
 		logger.info("%s: the Rewards page could not be read (%s), not running", account.name, state.unreadable)
 
 
+def _quit_driver(driver, account_name: str) -> None:
+	try:
+		driver.quit()
+	except Exception as exc:
+		# quit() raises when the browser is already gone. Letting it out
+		# here would replace whatever actually went wrong with the tidy-up's
+		# own error, and the process it is meant to end is dead anyway.
+		logger.warning(
+			"%s: the driver did not shut down cleanly: %s",
+			account_name,
+			log_utils.exception_summary(exc),
+		)
+
+
+def _start_account_driver(account: accounts.Account):
+	try:
+		if not desktop_utils.prepare_desktop_before_launch():
+			return None
+		return browser.start_driver(account)
+	finally:
+		desktop_utils.switch_back_after_launch()
+
+
+def _run_mobile_in_fresh_session(account: accounts.Account) -> None:
+	"""Run mobile searches in a clean Edge session without Desktop CDP state.
+
+	Reusing the Desktop driver carries over MSRewards/Desktop headers and
+	pooled Bing connections, causing Bing to award 0 mobile points even when
+	every mobile search succeeds. Launching a fresh Edge process on the same
+	worker virtual desktop matches the standalone mobile runner.
+	"""
+	task_id, name, _ = rewards_tasks.MOBILE_TASK
+	began = time.monotonic()
+	run_record.emit("task_start", task=task_id, name=name)
+	outcome, reason = "ok", None
+	progress = "sent 0 mobile searches"
+
+	logger.info("Starting a fresh Edge session for Mobile searches...")
+	mobile_driver = _start_account_driver(account)
+	if mobile_driver is None:
+		reason = "could not start a fresh Edge session for mobile searches"
+		outcome = "fail"
+		rewards_tasks.logger.error("[FAIL] %s: %s", name, reason)
+		run_record.emit("task_end", task=task_id, name=name, outcome=outcome, detail=reason,
+			progress=progress, duration_ms=round((time.monotonic() - began) * 1000))
+		return
+
+	def set_progress(msg: str) -> None:
+		nonlocal progress
+		progress = msg
+
+	try:
+		try:
+			mobile_search.run_mobile_searches(mobile_driver, progress_cb=set_progress)
+			rewards_tasks.logger.info("[OK] %s", name)
+		except Exception as exc:
+			tag, reason = rewards_tasks.task_failure_report(exc, progress)
+			outcome = "skip" if tag == "SKIP" else "fail"
+			rewards_tasks.logger.log(
+				logging.WARNING if tag == "SKIP" else logging.ERROR,
+				"[%s] %s: %s", tag, name, reason,
+				exc_info=rewards_tasks.logger.isEnabledFor(logging.DEBUG),
+			)
+		run_record.emit("task_end", task=task_id, name=name, outcome=outcome, detail=reason,
+			progress=progress, duration_ms=round((time.monotonic() - began) * 1000))
+		if _plan.read_state:
+			state = rewards_state.read_state(mobile_driver, element_selectors.ElementSelectionUtils(mobile_driver))
+			run_record.emit("state", phase="after", **dataclasses.asdict(state))
+	finally:
+		_quit_driver(mobile_driver, account.name)
+
+
 def run_account(account: accounts.Account) -> bool:
 	"""Work one account. Returns whether the browser started."""
 	global _account_started, _account_ran
@@ -79,19 +153,14 @@ def run_account(account: accounts.Account) -> bool:
 			run_record.emit("browser_failed", account=account.name)
 		run_record.emit("account_end", account=account.name, started=_account_started, ran_tasks=_account_ran,
 			error_code=error_code, duration_ms=round((time.monotonic() - began) * 1000))
-	try:
-		if not desktop_utils.prepare_desktop_before_launch():
-			ended("browser_failed")
-			return False
-		driver = browser.start_driver(account)
-	finally:
-		desktop_utils.switch_back_after_launch()
 
+	driver = _start_account_driver(account)
 	if driver is None:
 		ended("browser_failed")
 		return False
 
 	_account_started = True
+	run_mobile = False
 	try:
 		only = None
 		if _plan.read_state:
@@ -116,35 +185,33 @@ def run_account(account: accounts.Account) -> bool:
 		_account_ran = True
 		if only is None:
 			rewards.complete_all_tasks()
+			run_mobile = _plan.mobile
 		else:
 			rewards.complete_all_tasks(only=only)
-		if _plan.read_state:
+		if _plan.read_state and not run_mobile:
 			driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {"headers": {}})
 			state = rewards_state.read_state(driver, rewards.elements)
 			run_record.emit("state", phase="after", **dataclasses.asdict(state))
-		ended()
 	except KeyboardInterrupt:
 		ended()
 		raise
 	finally:
-		try:
-			driver.quit()
-		except Exception as exc:
-			# quit() raises when the browser is already gone. Letting it out
-			# here would replace whatever actually went wrong with the tidy-up's
-			# own error, and the process it is meant to end is dead anyway.
-			logger.warning(
-				"%s: the driver did not shut down cleanly: %s",
-				account.name,
-				log_utils.exception_summary(exc),
-			)
+		_quit_driver(driver, account.name)
 
+	if run_mobile:
+		try:
+			_run_mobile_in_fresh_session(account)
+		except KeyboardInterrupt:
+			ended()
+			raise
+
+	ended()
 	return True
 
 
 def main(unattended: bool = False, plan: RunPlan | None = None) -> int:
 	global _plan, _account_started, _account_ran
-	_plan = plan or RunPlan()
+	_plan = plan or RunPlan(mobile=mobile_search.is_mobile_search_enabled())
 	_plan = dataclasses.replace(_plan, read_state=_plan.read_state or _plan.only_if_open or _plan.check_only)
 	log_utils.setup_logging()
 	desktop_utils.reset_virtual_desktop_state()
@@ -240,13 +307,16 @@ def cli(argv: list[str] | None = None) -> int:
 	parser.add_argument("--min-points", type=int, default=DEFAULT_MIN_POINTS, help="point threshold for --only-if-open (default: 15)")
 	parser.add_argument("--run-if-unreadable", action="store_true", help="allow --only-if-open to run when the page cannot be read")
 	parser.add_argument("--check-only", action="store_true", help="record open work without starting any tasks")
+	parser.add_argument("--mobile", action="store_true", help="also run mobile searches in the same Edge session")
+	parser.add_argument("--no-mobile", action="store_true", help="disable mobile searches even if ENABLE_MOBILE_SEARCH is set")
 	arguments = parser.parse_args(argv)
 	if os.path.isfile(DOTENV_PATH): dotenv.load_dotenv(DOTENV_PATH)
 	minimum = arguments.min_points
 	if minimum < 0:
 		parser.error("--min-points must not be negative")
+	mobile = arguments.mobile or (not arguments.no_mobile and mobile_search.is_mobile_search_enabled())
 	return main(unattended=arguments.unattended, plan=RunPlan(arguments.read_state or arguments.only_if_open or arguments.check_only,
-		arguments.only_if_open, arguments.check_only, minimum, arguments.run_if_unreadable))
+		arguments.only_if_open, arguments.check_only, minimum, arguments.run_if_unreadable, mobile))
 
 
 if __name__ == "__main__":

@@ -1,10 +1,39 @@
 import re
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from selenium.webdriver.common.by import By
 from selenium.webdriver.remote.webelement import WebElement
 from selenium.common.exceptions import NoSuchElementException, StaleElementReferenceException
 from selenium import webdriver
+
+
+def _normalized(text: str) -> str:
+	return " ".join((text or "").lower().split())
+
+
+def is_bing_results_url(url: str, query: str | None = None) -> bool:
+	"""Whether url is a Bing results page, for query when one is given.
+
+	Shared by the desktop and the mobile searches. The query is compared
+	loosely, as a substring of q: Bing keeps the typed operators, but
+	leftover text in the box would be in front of it.
+	"""
+	try:
+		parts = urlsplit(url or "")
+	except ValueError:
+		return False
+
+	host = parts.netloc.lower()
+
+	if not (host == "bing.com" or host.endswith(".bing.com")) or not parts.path.startswith("/search"):
+		return False
+
+	q = parse_qs(parts.query).get("q", [""])[0]
+
+	if not q.strip():
+		return False
+
+	return query is None or _normalized(query) in _normalized(q)
 
 
 class ElementNotReady(NoSuchElementException):
@@ -594,8 +623,71 @@ return (
 	# bing search page
 	# ------------------------------------------------------------------
 
+	# Tried in order, first visible match wins. Bing has shipped the box as a
+	# textarea and as an input, and the id is not on every variant.
+	BING_SEARCH_BAR_SELECTORS = (
+		"#sb_form_q",
+		"textarea[name='q']",
+		"input[name='q'][type='search']",
+		"input[name='q']",
+	)
+
+	BING_SEARCH_SUBMIT_SELECTORS = (
+		"#search_icon",
+		"#sb_form_go",
+		"label[for='sb_form_go']",
+		"#sb_search button",
+	)
+
+	# Any one of these means the results page rendered. #b_results alone was
+	# not enough: answers, a news layout or a slow hydration can leave it out
+	# for a while, which is one way the confirmation wait ran out.
+	BING_RESULTS_SELECTORS = (
+		"#b_results",
+		"#b_content",
+		"ol#b_results > li",
+		"#b_context",
+		"#b_tween",
+		"main[aria-label] #b_results",
+	)
+
+	def _first_visible_css(self, selectors) -> WebElement | None:
+		for selector in selectors:
+			for match in self.driver.find_elements(By.CSS_SELECTOR, selector):
+				try:
+					if match.is_displayed():
+						return match
+				except StaleElementReferenceException:
+					continue
+
+		return None
+
 	def get_bing_search_bar(self):
+		found = self._first_visible_css(self.BING_SEARCH_BAR_SELECTORS)
+
+		if found is not None:
+			return found
+
+		# The original lookup, kept as the last resort.
 		return self.driver.find_element(By.TAG_NAME, "textarea")
+
+	def get_bing_search_submit_button(self):
+		found = self._first_visible_css(self.BING_SEARCH_SUBMIT_SELECTORS)
+
+		if found is None:
+			raise NoSuchElementException("no visible Bing search submit button")
+
+		return found
+
+	def get_bing_results_marker(self):
+		"""Something only a rendered Bing results page has."""
+		for selector in self.BING_RESULTS_SELECTORS:
+			matches = self.driver.find_elements(By.CSS_SELECTOR, selector)
+
+			if matches:
+				return matches[0]
+
+		raise NoSuchElementException("no Bing results container on the page")
 
 	def get_clear_bing_search_query_button(self):
 		return self.driver.find_element(By.ID, "sw_clx")
