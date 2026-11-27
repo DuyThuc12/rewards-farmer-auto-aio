@@ -112,6 +112,8 @@ def task_failure_report(exc: BaseException, progress: str | None = None) -> tupl
 
 	if progress is None:
 		if cause is None:
+			if isinstance(exc, element_selectors.VisualSearchUnavailable):
+				return "SKIP", f"not available in this UI variant: {exc.reason}"
 			return "SKIP", f"not available in this UI variant ({name})"
 
 		return "FAIL", cause
@@ -230,6 +232,9 @@ class RewardsTaskUtils:
 
 			try:
 				element_or_elements = element_getter()
+			except (element_selectors.UnexpectedVisualSearchPanel, element_selectors.VisualSearchUnavailable):
+				# Identified absence/wrong panel is not a late-arriving control.
+				raise
 			except Exception as exc:
 				# Exception rather than a bare except, so Ctrl+C during a
 				# getter ends the run instead of being retried away.
@@ -402,12 +407,15 @@ class RewardsTaskUtils:
 	def complete_visual_search(self):
 		self.switch_to_earn_page()
 
-		if not os.path.exists(VISUAL_SEARCH_IMAGE_PATH):
-			logger.info("visual_search.jpg not found. Generating visual search image...")
-			import random_image_for_visual_search
-			random_image_for_visual_search.get_random_image()
-
-		self.wait_for_then_click(self.elements.get_open_visual_search_sidebar)
+		try:
+			self.elements.get_open_visual_search_sidebar()
+		except (element_selectors.ElementNotReady, StaleElementReferenceException):
+			# An absent tile in a rendered row is definitive; an empty row is not.
+			self.wait_for_element(self.elements.get_open_visual_search_sidebar)
+		if self.elements.visual_search_tile_done_today():
+			logger.info("Visual search is already done for today")
+			return
+		self.move_to_and_click(self.elements.get_open_visual_search_sidebar)
 		self.progress = "opened the sidebar"
 
 		# Once today's visual search is done the panel has no link left to
@@ -424,10 +432,22 @@ class RewardsTaskUtils:
 
 				raise
 
-		if self.wait_for_element(link_or_done) is done:
+		try:
+			result = self.wait_for_element(link_or_done)
+		except TimeoutException:
+			self._log_visual_search_sidebar()
+			raise
+
+		if result is done:
 			logger.info("Visual search is already done for today")
 
 			return
+
+		# Do not download an image for an unavailable or already completed task.
+		if not os.path.exists(VISUAL_SEARCH_IMAGE_PATH):
+			logger.info("visual_search.jpg not found. Generating visual search image...")
+			import random_image_for_visual_search
+			random_image_for_visual_search.get_random_image()
 
 		self.move_to_and_click(self.elements.get_search_now_link_from_visual_search_sidebar)
 
@@ -463,6 +483,45 @@ class RewardsTaskUtils:
 
 		self.tab_utils.switch_to_other_tab()
 		self.tab_utils.close_all_other_tabs()
+
+	def _log_visual_search_sidebar(self):
+		# "Opened the sidebar" only means the click returned. When the next
+		# wait fails (#138), distinguish a missing panel from an unrecognised
+		# action. Read controls only, never the page text, URLs or account data.
+		try:
+			sections = [
+				section for section in self.driver.find_elements(By.TAG_NAME, "section")
+				if (section.get_dom_attribute("id") or "").startswith("react-aria")
+			]
+			visible = [section for section in sections if section.is_displayed()]
+			if not visible:
+				logger.warning(
+					"Visual search: no visible react-aria sidebar after the opener click "
+					"(%s matching section(s)); action wait expired", len(sections)
+				)
+				return
+
+			logger.warning(
+				"Visual search: %s visible react-aria sidebar(s); "
+				"no Search now/Activate streak or done marker matched during the wait", len(visible)
+			)
+			for index, section in enumerate(visible):
+				controls = []
+				for control in section.find_elements(By.CSS_SELECTOR, 'a, button, [role="link"]')[:12]:
+					try:
+						if not control.is_displayed():
+							continue
+						label = " ".join((control.text or "").split())[:60]
+						role = " ".join((control.get_dom_attribute("role") or "-").split())[:24]
+						disabled = " ".join((control.get_dom_attribute("aria-disabled") or "-").split())[:8]
+						controls.append(f"{control.tag_name} role={role} aria-disabled={disabled} label={label!r}")
+					except StaleElementReferenceException:
+						continue
+				logger.warning("Visual search: sidebar[%s] controls: %s", index, "; ".join(controls) or "<none>")
+		except Exception as exc:
+			# A disappearing panel or dead driver must not replace the task's
+			# original timeout with a failure of the diagnostic itself.
+			logger.warning("Visual search: sidebar diagnostics unavailable (%s)", type(exc).__name__)
 
 	def complete_misc_cards(self):
 		self.switch_to_earn_page()
