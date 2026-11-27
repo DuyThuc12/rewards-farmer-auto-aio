@@ -1,7 +1,7 @@
 [project]
 name = "bing-rewards-bot"
-version = "0.1.0"
-description = "Script to farm MS Rewards points on desktop"
+version = "1.0.0"
+description = "Automated Microsoft Rewards farmer for Desktop & Mobile Search with Windows Virtual Desktop isolation and one-click Windows setup"
 authors = [
     {name = "Carl Furtado",email = "user0332@duck.com"}
 ]

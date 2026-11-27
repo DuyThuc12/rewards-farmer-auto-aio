@@ -1,13 +1,27 @@
 # DuyThuc12/rewards-farmer-auto
 
+[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Unit Tests](https://github.com/DuyThuc12/rewards-farmer-auto/actions/workflows/unit-tests.yml/badge.svg)](https://github.com/DuyThuc12/rewards-farmer-auto/actions/workflows/unit-tests.yml)
+[![Windows Tests](https://github.com/DuyThuc12/rewards-farmer-auto/actions/workflows/windows-tests.yml/badge.svg)](https://github.com/DuyThuc12/rewards-farmer-auto/actions/workflows/windows-tests.yml)
+[![Latest Release](https://img.shields.io/github/v/release/DuyThuc12/rewards-farmer-auto)](https://github.com/DuyThuc12/rewards-farmer-auto/releases/latest)
+
 Automated Microsoft Rewards farming for **Desktop + Mobile Search**, with Windows Virtual Desktop isolation, resilient Bing search recovery, and one-click Windows setup scripts.
 
 Forked from [User0332/rewards-farmer](https://github.com/User0332/rewards-farmer) (based on [https://youtu.be/4qdPcMNaioA](https://youtu.be/4qdPcMNaioA)).
 
 A Windows desktop app built on the upstream farmer, with setup, run history and a schedule, lives in [mardausdennis/rewards-farmer-app](https://github.com/mardausdennis/rewards-farmer-app).
 
+## Highlights in This Fork
+
+- **Integrated Mobile Search (`src/mobile_search.py`)**: Completes mobile Bing searches via CDP mobile emulation (iPhone / iOS user agent, viewport, touch) in a clean Edge session so mobile points credit reliably.
+- **One-Click Windows Setup & Runner**: Interactive `setup.bat` (Python, Ollama + `llama3.2`, `venv`, `.env`, Desktop shortcut, first-time Edge sign-in) and `run_rewards.bat` (supports `--no-pause` for Task Scheduler) plus standalone `run_mobile_search.bat`.
+- **Resilient Bing Search Recovery**: Verifies navigation and results container rendering on both desktop and mobile with automatic 3-step recovery (`reload` → `bing home` → `direct search URL`).
+- **Updated Selectors & Visual Search Diagnostics**: Refreshed Rewards/Bing selectors, improved runtime `.env` handling, and automatic Wikipedia image fetching with better diagnostics for the Visual Search task.
+
 ## Table of Contents
 
+- [Highlights in This Fork](#highlights-in-this-fork)
 - [Quick Start (Windows)](#quick-start-windows)
 - [Core Setup & Running Instructions](#core-setup--running-instructions)
 	- [Installing Dependencies](#installing-dependencies)
